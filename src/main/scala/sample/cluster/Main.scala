@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory
 import sample.cluster.RoleManager.BindRole
 
 import scala.collection.JavaConverters._
+import scala.util.Random
 
 /**
   * @author Anton Gnutov
@@ -24,9 +25,11 @@ object Main extends App {
   val roles = config.getStringList("sample.roles").asScala
 
   roles.foreach { role =>
-    roleManager ! BindRole(role, _ => {
-      log.info(s"Role $role started!!!")
-    })
+    if (Random.nextBoolean()) {
+      roleManager ! BindRole(role, _ => {
+        log.info(s"Role $role started!!!")
+      })
+    }
   }
 
   system.actorOf(ClusterSingletonManager.props(

@@ -2,8 +2,8 @@ package sample.cluster
 
 import akka.actor.{Actor, ActorLogging, Props}
 import akka.cluster.Cluster
-import akka.cluster.ddata.Replicator.{Changed, Subscribe, Unsubscribe}
-import akka.cluster.ddata.{DistributedData, ORMultiMapKey}
+import akka.cluster.ddata.Replicator._
+import akka.cluster.ddata.{DistributedData, ORMultiMap, ORMultiMapKey}
 import sample.cluster.RoleManager.{BindRole, RoleAction, StartRole}
 
 /**
@@ -16,27 +16,31 @@ class RoleManager extends Actor with ActorLogging {
   implicit val cluster = Cluster(context.system)
 
   val replicator = DistributedData(context.system).replicator
-  val DataKey = ORMultiMapKey[String]("singletonRoles")
+  val DataKeyRun = ORMultiMapKey[String]("runRoles")
+  val DataKeyBound = ORMultiMapKey[String]("boundRoles")
 
   override def preStart(): Unit = {
-    replicator ! Subscribe(DataKey, self)
+    replicator ! Subscribe(DataKeyRun, self)
     log.info("RoleManager Started")
   }
 
   override def postStop(): Unit = {
-    replicator ! Unsubscribe(DataKey, self)
+    replicator ! Unsubscribe(DataKeyRun, self)
     log.info("RoleManager Stopped")
   }
 
   override def receive: Receive = {
-    case c@Changed(DataKey) =>
-      c.get(DataKey).entries.get(cluster.selfAddress.toString).foreach { entries =>
+    case c@Changed(DataKeyRun) =>
+      c.get(DataKeyRun).entries.get(cluster.selfAddress.toString).foreach { entries =>
         entries.foreach(self ! StartRole(_))
       }
 
     case BindRole(role, action) =>
       log.info("Binding role {} ...", role)
       roleBinding += (role -> action)
+
+      val address = cluster.selfAddress.toString
+      replicator ! Update(DataKeyBound, ORMultiMap.empty[String], WriteLocal)(_ + (address -> roleBinding.keySet))
 
     case StartRole(role) if startedRoles(role) =>
       log.debug("Role {} already started", role)
@@ -47,7 +51,7 @@ class RoleManager extends Actor with ActorLogging {
           action()
           startedRoles += role
         case None =>
-          log.warning("Role {} is not bound")
+          log.warning("Role {} is not bound", role)
       }
   }
 }

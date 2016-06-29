@@ -1,14 +1,14 @@
 package sample.cluster
 
 import akka.actor._
+import akka.cluster.Cluster
 import akka.cluster.ddata.Replicator.{GetFailure, NotFound, UpdateTimeout, _}
 import akka.cluster.ddata._
-import akka.cluster.{Cluster, Member}
-import sample.cluster.RolesCoordinatorActor.CheckClusterState
+import sample.cluster.RolesCoordinatorActor.{CheckClusterState, DataMap}
 
 import scala.concurrent.duration._
 
-class RolesCoordinatorActor(singletonRoles: Set[String]) extends Actor with ActorLogging {
+class RolesCoordinatorActor(roles: Set[String]) extends Actor with ActorLogging {
 
   val checkInterval = 5.seconds
 
@@ -17,56 +17,69 @@ class RolesCoordinatorActor(singletonRoles: Set[String]) extends Actor with Acto
 
   implicit val cluster = Cluster(context.system)
 
-  var rolesMapping: Map[String, Member] = Map.empty
+  var rolesBound: DataMap = Map.empty
 
   val replicator = DistributedData(context.system).replicator
-  val DataKey = ORMultiMapKey[String]("singletonRoles")
+  val DataKeyRun = ORMultiMapKey[String]("runRoles")
+  val DataKeyBound = ORMultiMapKey[String]("boundRoles")
 
   override def preStart(): Unit = {
+    replicator ! Subscribe(DataKeyBound, self)
     log.info("Roles coordinator started")
   }
 
   override def postStop(): Unit = {
+    replicator ! Unsubscribe(DataKeyBound, self)
     checkClusterState.cancel()
   }
 
   override def receive: Receive = {
     case CheckClusterState =>
-      replicator ! Get(DataKey, ReadLocal)
+      replicator ! Get(DataKeyRun, ReadLocal)
+      replicator ! Get(DataKeyBound, ReadLocal)
 
-    case g@GetSuccess(DataKey, req) =>
-      val data = g.get(DataKey)
+    case g@GetSuccess(DataKeyBound, req) =>
+      val data = g.get(DataKeyBound)
+      val members = cluster.state.members.map(_.address.toString)
+      val leavers: Set[String] = data.entries.keySet -- members
+      leavers.foreach { member =>
+        replicator ! Update(DataKeyBound, data, WriteLocal)(_ - member)
+      }
+
+    case c@Changed(DataKeyBound) =>
+      rolesBound = c.get(DataKeyBound).entries
+      log.info("Bound roles: {}", rolesBound)
+
+    case g@GetSuccess(DataKeyRun, req) =>
+      val data = g.get(DataKeyRun)
       val members = cluster.state.members.map(_.address.toString)
 
       val leavers: Set[String] = data.entries.keySet -- members
       leavers.foreach { member =>
         log.info(s"Node $member removed")
-        replicator ! Update(DataKey, data, WriteLocal)(_ - member)
+        replicator ! Update(DataKeyRun, data, WriteLocal)(_ - member)
       }
 
-      val rolesToRestore: Set[String] = singletonRoles.diff(data.entries.flatMap { case (key, values) => values }.toSet)
+      val allBoundRoles = rolesBound.flatMap { case (key, values) => values }.toSet
+      val rolesToRestore: Set[String] = roles.diff(data.entries.flatMap { case (key, values) => values }.toSet).filter(allBoundRoles(_))
 
       if (rolesToRestore.nonEmpty) {
         log.info("Rebalancing cluster roles: {}", rolesToRestore.mkString("[", ", ", "]"))
-        val redistribution = RolesCoordinatorActor.distribute(members, rolesToRestore, data.entries)
+        val redistribution = RolesCoordinatorActor.distribute(members, rolesToRestore, rolesBound, data.entries)
 
-        log.info("Roles distribution:")
+        log.info("Roles distribution: {}", redistribution)
         redistribution.foreach { case (key, values) =>
-          replicator ! Update(DataKey, ORMultiMap.empty[String], WriteLocal)(_ + (key -> values))
-
-          if (values.nonEmpty) {
-            log.info("Node {}: {}", key, values.mkString("[", ", ", "]"))
-          }
+          replicator ! Update(DataKeyRun, ORMultiMap.empty[String], WriteLocal)(_ + (key -> values))
         }
       }
 
-    case NotFound(DataKey, req) =>
-      replicator ! Update(DataKey, ORMultiMap.empty[String], WriteLocal)(r => r)
-      log.warning(s"Data Key: $DataKey, does not exists, $req")
-    case GetFailure(DataKey, req) =>
-      log.warning(s"Cannot retrieve key: $DataKey, timeout occurred, $req")
-    case UpdateTimeout(DataKey, req) =>
-      log.warning(s"Cannot modify all nodes for key: $DataKey, within timeout $checkInterval, and $req")
+    case NotFound(DataKeyRun, req) =>
+      replicator ! Update(DataKeyRun, ORMultiMap.empty[String], WriteLocal)(r => r)
+      log.warning(s"Data Key: $DataKeyRun, does not exists, $req")
+    case GetFailure(DataKeyRun, req) =>
+      log.warning(s"Cannot retrieve key: $DataKeyRun, timeout occurred, $req")
+    case UpdateTimeout(dataKey, req) =>
+      log.warning(s"Cannot modify all nodes for key: $dataKey, within timeout $checkInterval, and $req")
   }
 }
 
@@ -75,7 +88,7 @@ object RolesCoordinatorActor {
 
   case object CheckClusterState
 
-  def distribute(members: Set[String], roles: Set[String], originalMap: DataMap = Map()): DataMap = {
+  def distribute(members: Set[String], roles: Set[String], rolesBound: DataMap, originalMap: DataMap = Map()): DataMap = {
     require(members.nonEmpty, "Cluster members must be non empty")
 
     val newNodes: Set[String] = members.diff(originalMap.keySet)
@@ -83,13 +96,16 @@ object RolesCoordinatorActor {
     var result: DataMap = originalMap ++ newNodes.map(_ -> Set.empty[String]).toMap
 
     roles.foreach { role =>
-      val (member, roles) = result.minBy {case (key, values) => values.size }
-      val newRoles = roles + role
-      result = result.updated(member, newRoles)
+      val nodesWithRole = result.filter { case (key, values) => rolesBound.get(key).exists(_ (role)) }
+      if (nodesWithRole.nonEmpty) {
+        val (member, roles) = nodesWithRole.minBy { case (key, values) => values.size }
+        val newRoles = roles + role
+        result = result.updated(member, newRoles)
+      }
     }
 
     result
   }
 
-  def props(singletonRoles: Set[String]): Props = Props(classOf[RolesCoordinatorActor], singletonRoles)
+  def props(roles: Set[String]): Props = Props(classOf[RolesCoordinatorActor], roles)
 }
